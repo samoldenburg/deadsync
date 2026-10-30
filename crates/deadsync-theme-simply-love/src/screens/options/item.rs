@@ -267,6 +267,9 @@ pub enum ItemId {
     AcSubmitFails,
     AcResultDialogs,
     AcQrLogin,
+    AcRequestline,
+    AcRequestlineProfile,
+    AcRequestlineStatus,
 
     // Online Scoring submenu (launcher)
     OsGsBsOptions,
