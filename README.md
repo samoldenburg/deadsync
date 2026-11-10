@@ -43,7 +43,7 @@ Windows backend requires Windows 10 or later.
 ### Linux build dependencies (Ubuntu/Debian)
 ```bash
 sudo apt update
-sudo apt install --no-install-recommends build-essential clang cmake pkg-config libclang-dev libdbus-1-dev libudev-dev libasound2-dev libpipewire-0.3-dev libvulkan-dev libgl1-mesa-dev
+sudo apt install --no-install-recommends build-essential clang cmake pkg-config libclang-dev libdbus-1-dev libudev-dev libasound2-dev libpipewire-0.3-dev libvulkan-dev libgl1-mesa-dev libshaderc-dev
 ```
 
 ### macOS build dependencies (Homebrew)
@@ -78,7 +78,7 @@ are required on either Apple Silicon (`/opt/homebrew`) or Intel (`/usr/local`):
 ```bash
 cargo run                       # fast dev build
 cargo run --profile local       # optimized, but faster to link than full release
-cargo build --release           # fully optimized (LTO) build for benchmarking/play
+cargo build --release           # fully optimized (LTO) build
 ```
 
 Before the first run, grant **Input Monitoring** to your terminal (see the
@@ -103,7 +103,7 @@ pkg install cmake python3 pkgconf alsa-lib alsa-plugins vulkan-validation-layers
 
 Test fixtures live in [deadsync-tests](https://github.com/pnn64/deadsync-tests),
 mounted as a Git submodule at `tests/fixtures`. Initialize the pinned fixture
-revision before compiling or running tests, examples, or benchmarks (Python
+revision before compiling or running tests or examples (Python
 3.11 or newer is required to restore split archives):
 
 ```sh
@@ -117,9 +117,25 @@ Archives over 50 MB are stored as parts of at most 48,000,000 bytes. The Python
 command verifies each part and restores the exact archives locally; restored
 files are ignored by Git. Run both commands again after fixture updates.
 
+Lua regression snapshots live in `tests/fixtures/regression-expectations`, grouped
+by crate. Snapshots of 50 MB or more are stored as gzip files and restored by the
+same setup command. Use `python scripts/prepare_test_fixtures.py --split` to prepare
+new oversized archives or snapshots before committing fixture changes.
+
 When updating fixtures, commit and push changes in `tests/fixtures` first, then
 commit the updated submodule pointer in this repository. Test runners and fixture
 maintenance scripts stay in this repository; their existing paths still work.
+
+## Performance changes
+
+Keep performance experiments in ignored `target/` output or a temporary
+checkout. Commit the selected production implementation and useful correctness
+tests. Remove timing harnesses, superseded implementations and measurement
+reports before merging; recreate a benchmark when a new investigation needs it.
+
+The official Lua 5.1 suite and its runner in `crates/deadlib-lua/benches/` are
+retained for repeatable interpreter benchmarks. Comparator runtimes and timing
+reports remain temporary output.
 
 ## Full song Lua tests
 
@@ -371,6 +387,8 @@ DeadSync can communicate directly with dance pad hardware over USB, bypassing th
 |-----|--------|------|
 | **StepManiaX** | ✅ Supported | [Documentation](docs/stepmaniax.md) |
 | **FSRio** | ✅ Supported | |
+| **Teejusb FSR firmware** | Serial threshold configuration; hardware validation pending | [Documentation](docs/teejusb-fsr.md) |
+| **RE:Flex V2** | Native input, per-sensor calibration/thresholds, and lights; hardware validation pending | [Documentation](docs/reflex-v2.md) |
 
 ## Data Directories
 

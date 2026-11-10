@@ -196,8 +196,8 @@ rgba_const!(UI_BOX_BG_COLOR, "#1E282F");
 const NAV_INITIAL_HOLD_DELAY: Duration = Duration::from_millis(250);
 // ScreenSelectMusic inherits Screen's default menu repeat timing via InputFilter:
 // 0.375s before repeating, then 8 repeats/sec.
-const OVERLAY_NAV_INITIAL_HOLD_DELAY: Duration = Duration::from_millis(375);
-const OVERLAY_NAV_REPEAT_SCROLL_INTERVAL: Duration = Duration::from_millis(125);
+const OVERLAY_NAV_INITIAL_HOLD_DELAY: Duration = screen_input::OVERLAY_NAV_INITIAL_HOLD_DELAY;
+const OVERLAY_NAV_REPEAT_SCROLL_INTERVAL: Duration = screen_input::OVERLAY_NAV_REPEAT_INTERVAL;
 const SRPG_TAB_SCROLL_DIVISOR: u32 = 4;
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
 // Simply Love [ScreenSelectMusic] CodeTogglePatternInfo="Select,Select".
@@ -1686,7 +1686,7 @@ pub struct State {
     pub active_color_index: i32,
     pub selection_animation_timer: f32,
     /// Per-side scorebox cycle clocks, restarted when a side's boards change.
-    pub scorebox_cycle_clocks: [gs_scorebox::ScoreboxCycleClock; 2],
+    pub(crate) scorebox_cycle_clocks: [gs_scorebox::ScoreboxCycleClock; 2],
     /// Per-side online fetch timeline on the selection-animation clock.
     scorebox_fetch_phase: [crate::scorebox::ScoreboxFetchPhase; 2],
     pub wheel_offset_from_selection: f32,
@@ -11039,7 +11039,7 @@ fn handle_raw_key_event_impl(
         }
         // `0` tares the focused threshold(s) to the live reading, like Up+Down.
         if let Some(k) = key
-            && pad_config::handle_raw_key_event(&mut state.pad_config_overlay, k)
+            && pad_config::handle_raw_key_event_with_modifiers(&mut state.pad_config_overlay, k, shift_held)
         {
             return ThemeInputResult::consumed(ThemeEffect::None);
         }
@@ -11651,6 +11651,9 @@ fn update_impl(state: &mut State, dt: f32, smx: &SmxAssignmentView) -> ThemeEffe
     lobby_overlay::update_overlay(&mut state.lobby_overlay, dt, &state.lobby_view.snapshot);
     queue_lobby_sounds(state);
     if pack_sync::poll(state) {
+        if crate::screens::pack_sync::update(&mut state.pack_sync_overlay, dt) {
+            queue_sfx(state, "assets/sounds/change.ogg");
+        }
         return ThemeEffect::None;
     }
     if let SyncOverlayState::NullOrDie(overlay) = &mut state.sync_overlay {
@@ -21472,11 +21475,3 @@ mod tests {
         assert_eq!(select_music_lobby_lock_text_for(&joined, 1, None), None);
     }
 }
-
-#[cfg(test)]
-#[path = "select_music/ui_dataflows_original.rs"]
-mod ui_dataflows_original;
-
-#[cfg(test)]
-#[path = "select_music/ui_dataflows_perf.rs"]
-mod ui_dataflows_perf_tests;
