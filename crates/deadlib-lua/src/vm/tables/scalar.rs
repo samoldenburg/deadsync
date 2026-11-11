@@ -4,6 +4,7 @@
 //! comparator stays in its native argument slot; cached eligibility never roots
 //! an old comparator or replaces the live function's identity check.
 use super::*;
+mod bulk;
 use crate::bytecode::{Instruction, OPEN, Op, RK};
 
 #[derive(Clone, Copy)]
@@ -213,7 +214,7 @@ impl Vm {
         None
     }
 
-    pub(super) fn sort_fast_context(&self) -> bool {
+    pub(in crate::vm) fn sort_fast_context(&self) -> bool {
         if self.budget.is_some()
             || self.hooks.mask != 0
             || self.hooks.enter.is_some()

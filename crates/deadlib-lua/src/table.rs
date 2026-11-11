@@ -1,5 +1,6 @@
 //! Array storage and indexed hash entries with deletion-safe linear iteration.
 
+pub(crate) mod sort;
 use crate::memory::{Buffer, Memory};
 use crate::{
     Error, ErrorKind, FunctionId, ParserPrototypeId, StringId, TableId, ThreadId, UserdataId, Value,
@@ -70,15 +71,14 @@ impl Key {
             Self::ParserPrototype(v) => (v.0, 10),
         }
     }
+    /// One multiplication mixes every identity bit into the upper half, which
+    /// the fold brings down to the low bits that select a slot. Slot order is
+    /// never observable: traversal follows insertion order.
+    #[inline]
     fn hash(self) -> usize {
         let (bits, tag) = self.identity();
-        let mut h = bits
-            ^ tag
-                .wrapping_mul(0x9e3779b97f4a7c15)
-                .wrapping_add(bits.rotate_left(17));
-        h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
-        (h ^ (h >> 31)) as usize
+        let h = (bits ^ tag.rotate_left(59)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (h ^ (h >> 32)) as usize
     }
 }
 
@@ -99,6 +99,9 @@ struct Entry {
     key: Key,
     value: Value,
 }
+
+#[derive(Debug)]
+pub(crate) struct InvalidNextKey;
 
 #[derive(Debug, Default)]
 pub(crate) struct Table {
@@ -286,6 +289,20 @@ impl Table {
     }
     // Equal finite numbers have identical bits after excluding negative zero,
     // so an unstable numeric sort cannot expose a changed tie permutation.
+    pub(crate) fn scalar_sort_values(&mut self, len: usize, numbers: bool) -> Option<&mut [Value]> {
+        if self.metatable().is_some() {
+            return None;
+        }
+        let values = self.array.get_mut(..len)?;
+        values
+            .iter()
+            .all(|value| match value {
+                Value::Number(_) => true,
+                Value::Boolean(_) | Value::Nil => !numbers,
+                _ => false,
+            })
+            .then_some(values)
+    }
     pub(crate) fn sort_finite_numbers(&mut self, len: usize) -> bool {
         let Some(values) = self.array.get_mut(..len) else {
             return false;
@@ -362,10 +379,14 @@ impl Table {
                 return Ok(());
             }
         }
-        if let Some((_, Some(i))) = self.slot(k) {
-            self.entries[i].value = value;
-            return Ok(());
-        }
+        let vacant = match self.slot(k) {
+            Some((_, Some(i))) => {
+                self.entries[i].value = value;
+                return Ok(());
+            }
+            Some((slot, None)) => Some(slot),
+            None => None,
+        };
         if value == Value::Nil {
             return Ok(());
         }
@@ -398,10 +419,18 @@ impl Table {
         if rebuild {
             self.rebuild(slots);
         }
-        let (slot, _) = self.slot(k).expect("table rebuild creates slots");
+        let slot = if rebuild {
+            self.slot(k).expect("table rebuild creates slots").0
+        } else {
+            vacant.expect("nonempty table has a vacant hash slot")
+        };
         self.slots[slot] = index;
         self.entries.push(Entry { key: k, value });
         Ok(())
+    }
+    #[inline]
+    pub(crate) fn set_grown_list(&mut self, index: usize, value: Value) {
+        self.array[index] = value;
     }
     pub fn grow_list_array(&mut self, end: usize) -> Result<(), Error> {
         let first = self.array.len();
@@ -415,9 +444,11 @@ impl Table {
             .map_err(|_| Error::memory())?;
         self.invalidate_trace();
         self.array.resize(end, Value::Nil);
-        for index in first..end {
-            if let Some(value) = self.take_hash(Key::Number(((index + 1) as f64).to_bits())) {
-                self.array[index] = value;
+        if !self.entries.is_empty() {
+            for index in first..end {
+                if let Some(value) = self.take_hash(Key::Number(((index + 1) as f64).to_bits())) {
+                    self.array[index] = value;
+                }
             }
         }
         Ok(())
@@ -439,6 +470,10 @@ impl Table {
         hi
     }
     pub fn next(&self, key: Value) -> Result<Option<(Value, Value)>, Error> {
+        self.next_entry(key)
+            .map_err(|_| Error::new(ErrorKind::Runtime, 0, "invalid key to 'next'"))
+    }
+    pub(crate) fn next_entry(&self, key: Value) -> Result<Option<(Value, Value)>, InvalidNextKey> {
         let (array, hash) = if key == Value::Nil {
             (0, 0)
         } else if let Some(i) = array_index(key).filter(|&i| i < self.array.len()) {
@@ -446,7 +481,7 @@ impl Table {
         } else if let Some((_, Some(i))) = Key::from_value(key).and_then(|k| self.slot(k)) {
             (self.array.len(), i + 1)
         } else {
-            return Err(Error::new(ErrorKind::Runtime, 0, "invalid key to 'next'"));
+            return Err(InvalidNextKey);
         };
         for (i, &value) in self.array.iter().enumerate().skip(array) {
             if value != Value::Nil {

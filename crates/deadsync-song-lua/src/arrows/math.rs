@@ -1,12 +1,31 @@
 //! The established native float algorithms, using rooted Rust host values.
 use super::*;
+
+fn indexed_n(
+    call: &mut HostCall<'_>,
+    state: Option<TableId>,
+    prefix: &str,
+    index: impl itoa::Integer,
+) -> Result<f32, Error> {
+    let mut number = itoa::Buffer::new();
+    let suffix = number.format(index);
+    let mut key = [0_u8; 40];
+    let end = prefix.len() + suffix.len();
+    key[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    key[prefix.len()..end].copy_from_slice(suffix.as_bytes());
+    n(
+        call,
+        state,
+        std::str::from_utf8(&key[..end]).expect("ASCII modifier key"),
+    )
+}
 pub(super) fn x_pos(call: &mut HostCall<'_>, b: &Data, args: &[Value]) -> Result<f32, Error> {
     with_options(call, args, |call, options, state| {
         use std::f32::consts::PI;
         let player = player_for(call, options)?;
         let column = strict(call, args, 1, 1.0)? as i32 - 1;
         let y = strict(call, args, 2, 0.0)?;
-        let style = crate::song_lua_style_info(&style_name(call));
+        let style = style_info(call);
         let column = usize::try_from(column)
             .ok()
             .filter(|column| *column < style.columns)
@@ -184,7 +203,7 @@ pub(super) fn x_pos(call: &mut HostCall<'_>, b: &Data, args: &[Value]) -> Result
 pub(super) fn zoom(call: &mut HostCall<'_>, _b: &Data, args: &[Value]) -> Result<f32, Error> {
     with_options(call, args, |call, _options, state| {
         let y = strict(call, args, 1, 0.0)?;
-        let style = crate::song_lua_style_info(&style_name(call));
+        let style = style_info(call);
         let column = strict(call, args, 2, 1.0)? as i32 - 1;
         let column = usize::try_from(column)
             .ok()
@@ -215,7 +234,7 @@ pub(super) fn zoom(call: &mut HostCall<'_>, _b: &Data, args: &[Value]) -> Result
         if tiny != 0.0 {
             zoom *= 0.5f32.powf(tiny);
         }
-        let tiny = n(call, state, &format!("tiny{}", column + 1))?;
+        let tiny = indexed_n(call, state, "tiny", column + 1)?;
         if tiny != 0.0 {
             zoom *= 0.5f32.powf(tiny);
         }
@@ -260,7 +279,11 @@ pub(super) fn alpha(call: &mut HostCall<'_>, b: &Data, args: &[Value]) -> Result
         }
         let attenuate = n(call, state, "attenuatey")?;
         if attenuate != 0.0 {
-            let x = crate::song_lua_style_column_x(&style_name(call), column.max(0) as usize);
+            let x = style_info(call)
+                .x_offsets
+                .get(column.max(0) as usize)
+                .copied()
+                .unwrap_or(0.0);
             y += attenuate * (offset / 64.0) * (offset / 64.0) * (x / 64.0);
         }
         let beat_y = n(call, state, "beaty")?;
@@ -325,7 +348,7 @@ pub(super) fn alpha(call: &mut HostCall<'_>, b: &Data, args: &[Value]) -> Result
                 adjust += sudden * scale(appearance_y, start, end, -1.0, 0.0).clamp(-1.0, 0.0);
             }
             adjust -= n(call, state, "stealth")?;
-            adjust -= n(call, state, &format!("stealth{}", column + 1))?;
+            adjust -= indexed_n(call, state, "stealth", column + 1)?;
             if n(call, state, "blink")? != 0.0 {
                 let wave = ((time * 10.0).sin() / 0.3333).round() * 0.3333;
                 adjust += scale(wave, 0.0, 1.0, -1.0, 0.0);
@@ -359,7 +382,7 @@ fn field_zoom(style: &crate::SongLuaStyleInfo) -> f32 {
 pub(super) fn y_pos(call: &mut HostCall<'_>, b: &Data, args: &[Value]) -> Result<f32, Error> {
     let y_offset = loose(call, args, 2, 0.);
     with_options(call, args, |call, options, state| {
-        let style = crate::song_lua_style_info(&style_name(call));
+        let style = style_info(call);
         let column = loose(call, args, 1, 1.0) as i32 - 1;
         let column = usize::try_from(column)
             .ok()
@@ -413,7 +436,7 @@ pub(super) fn rotation_z(call: &mut HostCall<'_>, _b: &Data, args: &[Value]) -> 
         let column = loose(call, args, 3, 1.0) as i32;
         let mut rotation = 0.0_f32;
         // ArrowEffects::ReceptorGetRotationZ uses radians for both offset levels.
-        let column_offset = n(call, state, &format!("confusionoffset{column}"))?;
+        let column_offset = indexed_n(call, state, "confusionoffset", column)?;
         if column_offset != 0.0 {
             rotation += column_offset * 180.0 / PI;
         }

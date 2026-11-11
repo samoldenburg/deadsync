@@ -19,8 +19,33 @@ mod statements;
 mod tasks;
 use tasks::Task;
 
-struct Local<'a> {
-    name: &'a [u8],
+/// Bytes of a local or upvalue name in the compiler's name pool.
+#[derive(Clone, Copy)]
+struct Name {
+    start: u32,
+    len: u32,
+    /// The first eight bytes, zero padded: most lookups reject without the pool.
+    head: u64,
+}
+fn name_head(name: &[u8]) -> u64 {
+    let mut bytes = [0; 8];
+    let len = name.len().min(8);
+    bytes[..len].copy_from_slice(&name[..len]);
+    u64::from_le_bytes(bytes)
+}
+impl Name {
+    fn range(self) -> std::ops::Range<usize> {
+        self.start as usize..self.start as usize + self.len as usize
+    }
+    /// Compare with `name`, whose `name_head` is `head`.
+    fn equals(self, pool: &[u8], name: &[u8], head: u64) -> bool {
+        self.head == head
+            && self.len as usize == name.len()
+            && (name.len() <= 8 || pool[self.range()] == *name)
+    }
+}
+struct Local {
+    name: Name,
     reg: u8,
     debug: usize,
     captured: bool,
@@ -45,11 +70,29 @@ enum LineUse {
     Copy,
 }
 
+// Keep the instruction and its temporary metadata together during emission.
+// Projecting the instruction lets lowering and jump patching share their fields.
+#[derive(Clone, Copy)]
+struct Emission {
+    instruction: Instruction,
+    line: u32,
+    live: u32,
+    hook: u32,
+}
+impl std::ops::Deref for Emission {
+    type Target = Instruction;
+    fn deref(&self) -> &Instruction {
+        &self.instruction
+    }
+}
+impl std::ops::DerefMut for Emission {
+    fn deref_mut(&mut self) -> &mut Instruction {
+        &mut self.instruction
+    }
+}
 #[derive(Default)]
-struct Function<'a> {
-    code: Vec<Instruction>,
-    lines: Vec<u32>,
-    gc_live: Vec<u32>,
+struct Function {
+    code: Vec<Emission>,
     gc_maps: Vec<[u64; 4]>,
     gc_index: HashMap<[u64; 4], u16>,
     gc_last: Option<u16>,
@@ -57,8 +100,8 @@ struct Function<'a> {
     debug_hidden: [u64; 4],
     debug_named: [u64; 4],
     constants: constants::Constants,
-    locals: Vec<Local<'a>>,
-    upvalues: Vec<(&'a [u8], Upvalue)>,
+    locals: Vec<Local>,
+    upvalues: Vec<(Name, Upvalue)>,
     loops: Vec<(u16, Vec<usize>)>,
     next: u16,
     max: u16,
@@ -70,17 +113,51 @@ struct Function<'a> {
     debug_calls: Vec<DebugCall>,
     debug_temporaries: Vec<u8>,
     debug_lines: Vec<u32>,
-    hook_lines: Vec<u32>,
     hook_visible: usize,
     logical_tests: Vec<usize>,
     debug_stack: u16,
     zero_sign: Option<bool>,
 }
 
+impl Function {
+    /// Restore the default state while keeping every buffer's capacity.
+    fn reset(&mut self) {
+        self.code.clear();
+        self.gc_maps.clear();
+        self.gc_index.clear();
+        self.gc_last = None;
+        self.live = [0; 4];
+        self.debug_hidden = [0; 4];
+        self.debug_named = [0; 4];
+        self.constants.clear();
+        self.locals.clear();
+        self.upvalues.clear();
+        self.loops.clear();
+        self.next = 0;
+        self.max = 0;
+        self.params = 0;
+        self.vararg = false;
+        self.compat_arg = false;
+        self.defined = [0; 2];
+        self.debug_locals.clear();
+        self.debug_calls.clear();
+        self.debug_temporaries.clear();
+        self.debug_lines.clear();
+        self.hook_visible = 0;
+        self.logical_tests.clear();
+        self.debug_stack = 0;
+        self.zero_sign = None;
+    }
+}
+
 struct Compiler<'a> {
     ast: &'a Ast,
-    function: Function<'a>,
-    parents: Vec<Function<'a>>,
+    function: Function,
+    parents: Vec<Function>,
+    /// Finished functions whose cleared buffers serve later nested functions.
+    spare: Vec<Function>,
+    /// Local and upvalue names of every function in this compilation.
+    names: Vec<u8>,
     prototypes: Vec<Prototype>,
     folded: Vec<Option<f64>>,
     tasks: Vec<Task<'a>>,
@@ -89,19 +166,64 @@ struct Compiler<'a> {
     line: u32,
 }
 
+/// Code generation storage kept between compilations by one owner.
+#[derive(Default)]
+pub(crate) struct Spare {
+    functions: Vec<Function>,
+    names: Vec<u8>,
+    folded: Vec<Option<f64>>,
+    tasks: Vec<Task<'static>>,
+}
+
+/// Reuse an empty continuation stack for a borrow of a different syntax tree.
+fn recycle<'b>(mut tasks: Vec<Task<'_>>) -> Vec<Task<'b>> {
+    tasks.clear();
+    // An empty source yields nothing; in-place collection keeps the allocation.
+    tasks.into_iter().map(|_| unreachable!()).collect()
+}
+
+/// Move a buffer's values into an exact-size box, keeping the buffer's capacity.
+fn drain_boxed<T>(values: &mut Vec<T>) -> Result<Box<[T]>, Error> {
+    let mut exact = fallible::with_capacity(values.len())?;
+    exact.append(values);
+    exact.try_into_boxed_slice()
+}
+
 pub(crate) fn compile(ast: Ast, name: &[u8]) -> Result<Program, Error> {
+    compile_in(&ast, name, &mut Spare::default())
+}
+
+/// Compile with storage from `spare`, which keeps it again after success.
+pub(crate) fn compile_in(ast: &Ast, name: &[u8], spare: &mut Spare) -> Result<Program, Error> {
+    let mut functions = std::mem::take(&mut spare.functions);
+    let mut function = functions.pop().unwrap_or_default();
+    function.vararg = true;
+    function.zero_sign = ast.root_zero_sign;
+    function.debug_stack = ast.root_stack;
+    let mut folded = std::mem::take(&mut spare.folded);
+    crate::optimizer::literals_into(ast, &mut folded)?;
+    let mut names = std::mem::take(&mut spare.names);
+    names.clear();
+    let mut tasks = recycle(std::mem::take(&mut spare.tasks));
+    if !crate::memory::compilation::active() {
+        // Every AST node emits about one instruction. Sizing the entry
+        // function's buffers up front avoids their growth copies; nested
+        // functions reuse buffers released by earlier functions.
+        let estimate = ast.exprs.len() + ast.stmts.len() + 8;
+        fallible::reserve(&mut function.code, estimate)?;
+        fallible::reserve(&mut function.debug_lines, estimate)?;
+        fallible::reserve(&mut tasks, 64)?;
+    }
+    tasks.try_push(Task::Block(ast.ids(ast.body)))?;
     let mut c = Compiler {
-        ast: &ast,
-        function: Function {
-            vararg: true,
-            zero_sign: ast.root_zero_sign,
-            debug_stack: ast.root_stack,
-            ..Function::default()
-        },
+        ast,
+        function,
         parents: Vec::new(),
+        spare: functions,
+        names,
         prototypes: Vec::new(),
-        folded: crate::optimizer::literals(&ast)?,
-        tasks: fallible::vec([Task::Block(&ast.body)])?,
+        folded,
+        tasks,
         result: 0,
         boolean: boolean::Boolean::default(),
         line: 1,
@@ -110,12 +232,20 @@ pub(crate) fn compile(ast: Ast, name: &[u8]) -> Result<Program, Error> {
     c.line = ast.end_line;
     c.emit(Op::Return, 0, 0, 0)?;
     let entry = c.finish()?;
+    spare.functions = c.spare;
+    spare.names = c.names;
+    spare.folded = c.folded;
+    spare.tasks = recycle(c.tasks);
     let p = Program::try_new(c.prototypes, entry, name)?;
     p.verify()?;
     Ok(p)
 }
 
 impl<'a> Compiler<'a> {
+    /// A cleared function, reusing the buffers of a finished one when possible.
+    fn fresh_function(&mut self) -> Function {
+        self.spare.pop().unwrap_or_default()
+    }
     fn finish(&mut self) -> Result<u32, Error> {
         let mut f = std::mem::take(&mut self.function);
         for i in &mut f.code {
@@ -159,7 +289,7 @@ impl<'a> Compiler<'a> {
                         matches!(next.op, Op::JumpFalse | Op::JumpTrue) && next.a == i.a
                     });
             if consumed_branch || branch_value {
-                f.hook_lines[pc] = 0;
+                f.code[pc].hook = 0;
             }
         }
         f.debug_lines.retain(|&l| l != 0);
@@ -172,16 +302,28 @@ impl<'a> Compiler<'a> {
         }
         let mut names = fallible::with_capacity(f.upvalues.len())?;
         let mut upvalues = fallible::with_capacity(f.upvalues.len())?;
-        for (name, value) in f.upvalues {
-            names.push(name.try_boxed()?);
+        for &(name, value) in &f.upvalues {
+            names.push(self.names[name.range()].try_boxed()?);
             upvalues.push(value);
         }
         let id = self.prototypes.len() as u32;
+        let mut code = fallible::with_capacity(f.code.len())?;
+        let mut lines = fallible::with_capacity(f.code.len())?;
+        let mut live = fallible::with_capacity(f.code.len())?;
+        let mut hooks = fallible::with_capacity(f.code.len())?;
+        for emitted in &f.code {
+            code.push(emitted.instruction);
+            lines.push(emitted.line);
+            live.push(emitted.live);
+            hooks.push(emitted.hook);
+        }
+        let debug_locals = drain_boxed(&mut f.debug_locals)?;
+        let debug_calls = drain_boxed(&mut f.debug_calls)?;
         self.prototypes.try_push(Prototype {
-            code: f.code.try_into_boxed_slice()?,
-            lines: f.lines.try_into_boxed_slice()?,
-            gc_live: f.gc_live.try_into_boxed_slice()?,
-            gc_maps: f.gc_maps.try_into_boxed_slice()?,
+            code: code.try_into_boxed_slice()?,
+            lines: lines.try_into_boxed_slice()?,
+            gc_live: live.try_into_boxed_slice()?,
+            gc_maps: f.gc_maps.try_boxed()?,
             constants: f.constants.finish()?,
             registers: f.max.max(f.debug_stack).max(2),
             params: f.params,
@@ -194,27 +336,55 @@ impl<'a> Compiler<'a> {
                 native: None,
                 defined: f.defined,
                 upvalues: names.try_into_boxed_slice()?,
-                locals: f.debug_locals.try_into_boxed_slice()?,
-                calls: f.debug_calls.try_into_boxed_slice()?,
-                active_lines: f.debug_lines.try_into_boxed_slice()?,
-                hook_lines: f.hook_lines.try_into_boxed_slice()?,
-                temporaries: f.debug_temporaries.try_into_boxed_slice()?,
+                locals: debug_locals,
+                calls: debug_calls,
+                active_lines: f.debug_lines.try_boxed()?,
+                hook_lines: hooks.try_into_boxed_slice()?,
+                temporaries: f.debug_temporaries.try_boxed()?,
             },
         })?;
+        f.reset();
+        self.spare.try_push(f)?;
         Ok(id)
     }
-    fn upvalue(&mut self, name: &'a [u8]) -> Result<Option<u16>, Error> {
-        if let Some(index) = self.function.upvalues.iter().position(|(n, _)| *n == name) {
+    fn intern_name(&mut self, name: &[u8]) -> Result<Name, Error> {
+        let start = u32::try_from(self.names.len()).map_err(|_| Error::memory())?;
+        let len = u32::try_from(name.len()).map_err(|_| Error::memory())?;
+        self.names.try_extend_from_slice(name)?;
+        Ok(Name {
+            start,
+            len,
+            head: name_head(name),
+        })
+    }
+    fn upvalue(&mut self, name: &[u8]) -> Result<Option<u16>, Error> {
+        let names = &self.names;
+        let head = name_head(name);
+        if let Some(index) = self
+            .function
+            .upvalues
+            .iter()
+            .position(|(n, _)| n.equals(names, name, head))
+        {
             return Ok(Some(index as u16));
         }
         let mut owner = None;
         for (index, parent) in self.parents.iter_mut().enumerate().rev() {
-            if let Some(local) = parent.locals.iter_mut().rev().find(|l| l.name == name) {
+            if let Some(local) = parent
+                .locals
+                .iter_mut()
+                .rev()
+                .find(|l| l.name.equals(names, name, head))
+            {
                 local.captured = true;
                 owner = Some((index, Upvalue::Local(local.reg)));
                 break;
             }
-            if let Some(up) = parent.upvalues.iter().position(|(n, _)| *n == name) {
+            if let Some(up) = parent
+                .upvalues
+                .iter()
+                .position(|(n, _)| n.equals(names, name, head))
+            {
                 owner = Some((index, Upvalue::Outer(up as u16)));
                 break;
             }
@@ -222,6 +392,7 @@ impl<'a> Compiler<'a> {
         let Some((owner, mut up)) = owner else {
             return Ok(None);
         };
+        let name = self.intern_name(name)?;
         for index in owner + 1..self.parents.len() {
             if self.parents[index].upvalues.len() >= 60 {
                 return Err(self.error(ErrorKind::Limit, "too many upvalues"));
@@ -329,12 +500,11 @@ impl<'a> Compiler<'a> {
                 if c == u32::from(load.a) {
                     c = value;
                 }
-                let before = self.function.gc_live.pop().unwrap() as u16 as usize;
+                let removed = self.function.code.pop().unwrap();
+                let before = removed.live as u16 as usize;
                 self.function.live = self.function.gc_maps[before];
-                self.function.code.pop();
-                self.function.lines.pop();
                 self.function.debug_lines.pop();
-                assert_eq!(self.function.hook_lines.pop(), Some(0));
+                assert_eq!(removed.hook, 0);
             }
         }
         let pc = self.function.code.len();
@@ -385,18 +555,15 @@ impl<'a> Compiler<'a> {
             _ => {}
         }
         let after = self.live_map()?;
-        self.function.code.try_push(Instruction { op, a, b, c })?;
+        let hook = if op == Op::Close { 0 } else { self.line };
+        self.function.code.try_push(Emission {
+            instruction: Instruction { op, a, b, c },
+            line: self.line,
+            live: u32::from(before) | (u32::from(after) << 16),
+            hook,
+        })?;
         self.function.hook_visible += usize::from(op != Op::Close && self.line != 0);
-        self.function.lines.try_push(self.line)?;
-        self.function
-            .hook_lines
-            .try_push(if op == Op::Close { 0 } else { self.line })?;
-        self.function
-            .debug_lines
-            .try_push(if op == Op::Close { 0 } else { self.line })?;
-        self.function
-            .gc_live
-            .try_push(u32::from(before) | (u32::from(after) << 16))?;
+        self.function.debug_lines.try_push(hook)?;
         if op == Op::Move
             && (c == OPEN
                 || u16::from(a) == b
@@ -411,7 +578,7 @@ impl<'a> Compiler<'a> {
         self.function.code[pc].c = self.function.code.len() as u32;
     }
     fn debug_line(&mut self, line: u32) {
-        let previous = *self.function.hook_lines.last().expect("emitted hook line");
+        let previous = self.function.code.last().expect("emitted hook line").hook;
         self.function.hook_visible =
             self.function.hook_visible + usize::from(line != 0) - usize::from(previous != 0);
         *self
@@ -419,11 +586,11 @@ impl<'a> Compiler<'a> {
             .debug_lines
             .last_mut()
             .expect("emitted debug line") = line;
-        *self
-            .function
-            .hook_lines
+        self.function
+            .code
             .last_mut()
-            .expect("emitted hook line") = line;
+            .expect("emitted hook line")
+            .hook = line;
     }
     fn constant(&mut self, mut k: Constant) -> Result<u32, Error> {
         if let Constant::Number(number) = &mut k
@@ -461,18 +628,20 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
     fn local(&self, name: &[u8]) -> Option<u8> {
+        let head = name_head(name);
         self.function
             .locals
             .iter()
             .rev()
-            .find(|l| l.name == name)
+            .find(|l| l.name.equals(&self.names, name, head))
             .map(|l| l.reg)
     }
-    fn bind(&mut self, name: &'a [u8], reg: u8) -> Result<(), Error> {
+    fn bind(&mut self, name: &[u8], reg: u8) -> Result<(), Error> {
         if self.function.locals.len() >= 200 {
             return Err(self.error(ErrorKind::Limit, "too many local variables"));
         }
         let debug = self.debug_local(name, reg)?;
+        let name = self.intern_name(name)?;
         self.function.locals.try_push(Local {
             name,
             reg,
@@ -547,7 +716,7 @@ impl<'a> Compiler<'a> {
                         .function
                         .upvalues
                         .iter()
-                        .any(|(n, _)| *n == name.as_ref())
+                        .any(|(n, _)| n.equals(&self.names, name, name_head(name)))
                     {
                         NameKind::Upvalue
                     } else {

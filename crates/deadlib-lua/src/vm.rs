@@ -23,9 +23,11 @@ mod math;
 mod memory_limit;
 mod meta;
 mod native;
+mod native_fast;
 mod os;
 mod package;
 mod reductions;
+mod simple;
 mod standalone;
 mod strings;
 mod tables;
@@ -161,10 +163,13 @@ impl Strings {
         (h ^ (h >> 31)) as usize
     }
     fn find(&self, bytes: &[u8]) -> Option<StringId> {
+        self.find_hashed(bytes, Self::hash(bytes))
+    }
+    fn find_hashed(&self, bytes: &[u8], hash: usize) -> Option<StringId> {
         if self.buckets.is_empty() {
             return None;
         }
-        let mut slot = Self::hash(bytes) & (self.buckets.len() - 1);
+        let mut slot = hash & (self.buckets.len() - 1);
         while self.buckets[slot] != 0 {
             let id = self.buckets[slot] - 1;
             if self.bytes[id as usize].as_ref() == bytes {
@@ -174,7 +179,7 @@ impl Strings {
         }
         None
     }
-    fn try_add(&mut self, bytes: ByteString) -> Result<StringId, Error> {
+    fn try_add(&mut self, bytes: ByteString, hash: usize) -> Result<StringId, Error> {
         let mut replacement = None;
         if (self.bytes.live_len() + 1) * 4 >= self.buckets.len() * 3 {
             let size = self
@@ -197,7 +202,6 @@ impl Strings {
             }
             replacement = Some(buckets);
         }
-        let hash = Self::hash(&bytes);
         let storage = bytes.storage_bytes();
         // Publish neither the hash index nor the string until every allocation
         // has succeeded. Arena accounting includes partially reserved buffers.
@@ -221,11 +225,15 @@ impl Strings {
         self.try_intern(bytes).expect("allocate Lua string")
     }
     fn try_intern(&mut self, bytes: &[u8]) -> Result<StringId, Error> {
-        if let Some(id) = self.find(bytes) {
+        let hash = Self::hash(bytes);
+        if let Some(id) = self.find_hashed(bytes, hash) {
             self.bytes.preserve_new_reference(id.0);
             Ok(id)
         } else {
-            self.try_add(ByteString::try_new(bytes, self.bytes.memory().clone())?)
+            self.try_add(
+                ByteString::try_new(bytes, self.bytes.memory().clone())?,
+                hash,
+            )
         }
     }
     fn substring(
@@ -234,12 +242,13 @@ impl Strings {
         range: std::ops::Range<usize>,
     ) -> Result<StringId, Error> {
         let bytes = &self.bytes[slot_index(id.0)][range];
-        if let Some(id) = self.find(bytes) {
+        let hash = Self::hash(bytes);
+        if let Some(id) = self.find_hashed(bytes, hash) {
             self.bytes.preserve_new_reference(id.0);
             return Ok(id);
         }
         let owned = ByteString::try_new(bytes, self.bytes.memory().clone())?;
-        self.try_add(owned)
+        self.try_add(owned, hash)
     }
 }
 
@@ -435,6 +444,8 @@ pub struct Vm {
     native_bodies: Buffer<host::Body>,
     patterns: crate::pattern::Cache,
     pattern_work: crate::pattern::Work,
+    // Parser and code generator storage reused by unbudgeted source loads.
+    compile_spare: loads::Spare,
     pattern_locale: u64,
     native_closures: Arena<threads::NativeClosure>,
     builtin_envs: Buffer<Option<TableId>>,
@@ -547,6 +558,7 @@ impl Vm {
             native_bodies: Buffer::new_in(memory.clone()),
             patterns: crate::pattern::Cache::new_in(memory.clone()),
             pattern_work: crate::pattern::Work::new_in(memory.clone()),
+            compile_spare: loads::Spare::default(),
             pattern_locale: crate::locale::revision(),
             native_closures: Arena::identified_in(memory.clone()),
             builtin_envs,
@@ -743,8 +755,11 @@ impl Vm {
             .map_err(|_| self.memory_failure())
     }
     fn intern_number(&mut self, number: f64) -> Result<Value, Error> {
-        let bytes = native::try_format_number(number).map_err(|_| self.memory_failure())?;
-        self.try_intern(&bytes)
+        let text = native::number_text(number);
+        let mut bytes = self.try_take_buffer(text.as_bytes().len())?;
+        bytes.extend_from_slice(text.as_bytes());
+        crate::locale::try_localize_owned(&mut bytes)?;
+        self.try_finish_buffer(bytes)
     }
     fn try_take_buffer(&mut self, capacity: usize) -> Result<Buffer<u8>, Error> {
         self.buffers
@@ -788,7 +803,7 @@ impl Vm {
         match value {
             Value::String(id) => Ok(Some(id)),
             Value::Number(number) => {
-                let Value::String(id) = self.try_intern(&format_number(number))? else {
+                let Value::String(id) = self.intern_number(number)? else {
                     unreachable!("intern returns a string")
                 };
                 Ok(Some(id))
@@ -1646,6 +1661,10 @@ impl Vm {
     }
 
     fn run(&mut self, error_line: &mut u32) -> Result<usize, Error> {
+        // The executing program's code, retained across frame transitions:
+        // calls and returns within one program keep it without touching its
+        // atomic reference count.
+        let mut held: Option<crate::memory::Shared<ProgramData>> = None;
         'frames: loop {
             self.maybe_gc()?;
             let frame_index = self.frames.len() - 1;
@@ -1686,12 +1705,43 @@ impl Vm {
             let (program_index, proto_index, env) =
                 (closure.program, closure.prototype, closure.env);
             // Hold immutable code independently of VM-vector growth during native calls.
-            // Shared ownership is acquired once on frame entry, never per instruction/value.
-            let data = self.programs[program_index].data.clone();
+            // Shared ownership changes only when a frame runs another program.
+            let current = &self.programs[program_index].data;
+            if !held
+                .as_ref()
+                .is_some_and(|data| crate::memory::Shared::ptr_eq(data, current))
+            {
+                held = Some(current.clone());
+            }
+            let data = held.as_ref().expect("executing program");
             let prototype = &data.prototypes[proto_index];
             let mut pc = frame.pc();
             let base = frame.base;
             loop {
+                // With no hook or instruction limit counting instructions,
+                // runs of simple ones execute without frame bookkeeping.
+                if self.hooks.mask & (hooks::LINE | hooks::COUNT) == 0 && self.budget.is_none() {
+                    let mut cx = simple::Context {
+                        registers: &mut self.registers,
+                        constants: &self.programs[program_index].constants[proto_index],
+                        tables: &self.tables,
+                        code: &prototype.code,
+                        env,
+                        base,
+                        closed: self.open_upvalues.is_empty(),
+                    };
+                    while let Some(next) = simple::step(&mut cx, pc) {
+                        pc = next;
+                    }
+                    let i = prototype.code[pc];
+                    if i.op == Op::GetUpvalue {
+                        let id =
+                            self.functions[slot_index(function.0)].upvalues[i.c as usize] as usize;
+                        self.registers[base + usize::from(i.a)] = self.cell_value(id);
+                        pc += 1;
+                        continue;
+                    }
+                }
                 if self.hooks.mask & (hooks::LINE | hooks::COUNT) != 0
                     && self.hook_instruction(frame_index, pc, prototype.debug.hook_lines[pc])?
                 {
@@ -1786,9 +1836,27 @@ impl Vm {
                             self.gc.pending = true;
                         }
                         result.map_err(|_| self.memory_failure())?;
-                        for offset in 0..count {
-                            let value = self.registers[a + 1 + offset];
-                            self.raw_set(id, Value::Number((c + offset) as f64), value)?;
+                        if end <= u32::MAX as usize {
+                            for offset in 0..count {
+                                let value = self.registers[a + 1 + offset];
+                                let index = c + offset - 1;
+                                if matches!(
+                                    value,
+                                    Value::Nil | Value::Boolean(_) | Value::Number(_)
+                                ) {
+                                    self.tables[slot_index(id.0)].set_grown_list(index, value);
+                                } else {
+                                    let key = Value::Number((index + 1) as f64);
+                                    self.reserve_gc_table_write(id, key, value)?;
+                                    self.tables[slot_index(id.0)].set_grown_list(index, value);
+                                    self.gc_table_write(id, key, value);
+                                }
+                            }
+                        } else {
+                            for offset in 0..count {
+                                let value = self.registers[a + 1 + offset];
+                                self.raw_set(id, Value::Number((c + offset) as f64), value)?;
+                            }
                         }
                         if self.gc.pending {
                             self.maybe_gc()?;

@@ -166,7 +166,9 @@ impl Vm {
                             output.try_extend_from_slice(&self.strings.bytes[slot_index(id.0)])?
                         }
                         Value::Number(n) => {
-                            output.try_extend_from_slice(&native::try_format_number(n)?)?
+                            let start = output.len();
+                            output.try_extend_from_slice(native::number_text(n).as_bytes())?;
+                            crate::locale::try_localize_owned_from(&mut output, start)?;
                         }
                         _ => {
                             return Err(fallible::diagnostic(
@@ -392,6 +394,9 @@ impl Vm {
                 && self.numeric_sort_gc_ready()
                 && self.tables[slot_index(table.0)].sort_finite_numbers(len as usize)
             {
+                return self.return_frame(frame, base, 0);
+            }
+            if self.try_bulk_sort(table, len as usize, comparator, error_line)? {
                 return self.return_frame(frame, base, 0);
             }
             let before = self.sorts.capacity();
